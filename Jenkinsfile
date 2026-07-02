@@ -1,59 +1,98 @@
+@Library(['jenkinslib@master']) _
+
 pipeline {
+    // Top-level agent is any, but we will use Docker agents for specific stages
     agent any
 
-    // Use the NodeJS plugin configured in Jenkins (assuming it's named 'node')
-    tools {
-        nodejs 'node'
-    }
-
     environment {
-        // Conditional logic: If branch is main, port is 3000. Otherwise (dev), port is 3001.
-        HOST_PORT = "${env.BRANCH_NAME == 'main' ? '3000' : '3001'}"
-        IMAGE_NAME = "my-app-${env.BRANCH_NAME}"
-        CONTAINER_NAME = "app-container-${env.BRANCH_NAME}"
+        // Docker credentials ID configured in Jenkins
+        DOCKER_CREDS = 'dockerhub-creds'
+        DOCKER_USER = 'kaji777'
+        
+        // Define distinct image names based on the branch
+        IMAGE_NAME = "${env.BRANCH_NAME == 'main' ? 'nodemain' : 'nodedev'}"
+        IMAGE_TAG = 'v1.0'
+        FULL_IMAGE = "${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
     }
 
     stages {
         stage('Checkout') {
             steps {
-                // Multibranch automatically checks out the branch, 
-                // but explicitly defining scm ensures we have the code.
                 checkout scm
             }
         }
         
-        stage('Build') {
+        stage('Lint Dockerfile (Hadolint)') {
             steps {
-                echo "Building environment for branch: ${env.BRANCH_NAME}"
+                echo "Running Hadolint..."
+                // Using the Hadolint docker image to scan the Dockerfile
+                sh 'docker run --rm -i hadolint/hadolint < Dockerfile'
+            }
+        }
+
+        stage('Build & Test (Docker Agent)') {
+            // Run these specific steps inside an isolated NodeJS Docker container
+            agent {
+                docker {
+                    image 'node:18-alpine'
+                    reuseNode true
+                }
+            }
+            steps {
+                echo "Installing dependencies and testing..."
                 sh 'npm install'
+                sh 'npm test --passWithNoTests'
             }
         }
-        
-        stage('Test') {
-            steps {
-                echo "Running automated tests..."
-                // Replace with actual test command if different
-                sh 'npm test --passWithNoTests' 
-            }
-        }
-        
+
         stage('Build Docker Image') {
             steps {
-                echo "Building Docker image: ${IMAGE_NAME}"
-                sh "docker build -t ${IMAGE_NAME} ."
+                echo "Building Image: ${FULL_IMAGE}"
+                sh "docker build -t ${FULL_IMAGE} ."
             }
         }
-        
-        stage('Deploy') {
+
+        stage('Security Scan (Trivy)') {
             steps {
-                echo "Deploying to port ${HOST_PORT}"
-                
-                // Stop and remove the old container if it exists to avoid port conflicts
-                sh "docker rm -f ${CONTAINER_NAME} || true"
-                
-                // Run the new container, mapping the dynamic HOST_PORT to the internal container port (e.g., 3000)
-                sh "docker run -d -p ${HOST_PORT}:3000 --name ${CONTAINER_NAME} ${IMAGE_NAME}"
+                echo "Scanning image for vulnerabilities..."
+                // Map the Docker socket so Trivy can inspect the locally built image
+                sh "docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy image --severity HIGH,CRITICAL ${FULL_IMAGE}"
             }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                // Authenticate and push
+                withCredentials([usernamePassword(credentialsId: DOCKER_CREDS, passwordVariable: 'DOCKER_PASS', usernameVariable: 'DOCKER_USER_VAR')]) {
+                    sh "echo 'n0H@5hxzxz@987' | docker login -u \$DOCKER_USER_VAR --password-stdin"
+                    sh "docker push ${FULL_IMAGE}"
+                }
+            }
+        }
+
+        stage('Trigger Deployment') {
+            steps {
+                echo "Triggering downstream deployment pipeline..."
+                // Use the Shared Library function just as an example of execution
+                DeployToMaster(anyparam: "Triggering deployment for ${env.BRANCH_NAME}")
+                
+                // Conditionally trigger the right downstream pipeline
+                script {
+                    if (env.BRANCH_NAME == 'main') {
+                        build job: 'Deploy_to_main', wait: false
+                    } else if (env.BRANCH_NAME == 'dev') {
+                        build job: 'Deploy_to_dev', wait: false
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            // Clean up local images to save space on the Linux VM
+            sh "docker rmi ${FULL_IMAGE} || true"
+            sh "docker logout"
         }
     }
 }
