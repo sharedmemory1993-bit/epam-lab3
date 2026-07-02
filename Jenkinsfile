@@ -1,5 +1,3 @@
-@Library(['jenkinslib@master']) _
-
 pipeline {
     // Top-level agent is any, but we will use Docker agents for specific stages
     agent any
